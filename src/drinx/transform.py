@@ -10,24 +10,57 @@ T = TypeVar("T")
 
 
 def _register_jax_tree(cls_: type[T]) -> type[T]:
-    """Registers a class as a JAX Pytree, safely preventing double-registration."""
+    """Registers a class as a JAX Pytree, safely preventing double-registration.
+
+    Field classification:
+    - ``jax_static=True``  + ``init=True``  -> aux bucket 1 (restored via __init__)
+    - ``jax_static=False`` + ``init=True``  -> traced leaves (restored via __init__)
+    - any                  + ``init=False`` -> aux bucket 2 (restored via object.__setattr__)
+
+    Private (``init=False``) fields must travel in aux rather than as leaves so
+    that JAX round-trips (jit, vmap, grad, etc.) can restore them.  They are
+    written back with ``object.__setattr__`` in ``unflatten``, which bypasses the
+    DataClass frozen guard safely because the object is still being initialised.
+    """
     # Guard: If already registered (e.g., by __init_subclass__), skip re-registering
     if getattr(cls_, "_jax_tree_registered", False):
         return cls_
 
-    static_fields = [f.name for f in fields(cls_) if f.metadata.get("jax_static")]
-    dynamic_fields = [f.name for f in fields(cls_) if not f.metadata.get("jax_static")]
+    all_fields = fields(cls_)
+    # Traced leaves: init=True and not jax_static
+    dynamic_fields = [
+        f.name for f in all_fields if not f.metadata.get("jax_static") and f.init
+    ]
+    # Aux bucket 1: explicitly static (jax_static=True) and init=True
+    static_init_fields = [
+        f.name for f in all_fields if f.metadata.get("jax_static") and f.init
+    ]
+    # Aux bucket 2: private (init=False), regardless of jax_static — must ride in aux
+    private_fields_names = [f.name for f in all_fields if not f.init]
 
     def flatten_with_keys(obj):
         keyed_leaves = [
             (jax.tree_util.GetAttrKey(f), getattr(obj, f)) for f in dynamic_fields
         ]
-        aux = tuple(getattr(obj, f) for f in static_fields)
+        aux = (
+            tuple(getattr(obj, f) for f in static_init_fields),
+            tuple(getattr(obj, f) for f in private_fields_names),
+        )
         return keyed_leaves, aux
 
     def unflatten(aux, leaves):
-        kwargs = {**dict(zip(static_fields, aux)), **dict(zip(dynamic_fields, leaves))}
-        return cls_(**kwargs)
+        static_init_values, private_values = aux
+        init_kwargs = {
+            **dict(zip(static_init_fields, static_init_values)),
+            **dict(zip(dynamic_fields, leaves)),
+        }
+        obj = cls_(**init_kwargs)
+        # Stamp private fields back after construction. object.__setattr__ bypasses
+        # DataClass.__setattr__'s frozen guard, which is safe here because we are
+        # restoring the exact values the object was flattened from.
+        for name, value in zip(private_fields_names, private_values):
+            object.__setattr__(obj, name, value)
+        return obj
 
     jax.tree_util.register_pytree_with_keys(cls_, flatten_with_keys, unflatten)
     cls_._jax_tree_registered = True  # ty:ignore[unresolved-attribute]

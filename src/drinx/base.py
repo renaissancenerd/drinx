@@ -16,6 +16,60 @@ from drinx.attribute import (
 )
 
 
+def _dataclass_replace(obj: Any, **changes: Any) -> Any:
+    """Functional replacement for :func:`dataclasses.replace` that correctly
+    handles private (``init=False``) fields.
+
+    :func:`dataclasses.replace` only forwards ``init=True`` fields to
+    ``__init__``, silently dropping any ``init=False`` field that appears in
+    *changes*.  This wrapper:
+
+    1. Collects the current values of **all** fields on *obj*.
+    2. Applies *changes* on top (regardless of ``init`` status).
+    3. Passes only the ``init=True`` fields to ``__init__`` to construct the
+       new instance.
+    4. Uses ``object.__setattr__`` to stamp the ``init=False`` fields onto the
+       freshly created (still-unfrozen) object.
+
+    Args:
+        obj: The frozen dataclass instance to copy.
+        **changes: Field-name → new-value pairs.  Both ``init=True`` and
+            ``init=False`` fields are accepted.
+
+    Returns:
+        A new instance of ``type(obj)`` with the requested fields replaced.
+
+    Raises:
+        TypeError: If any key in *changes* is not a recognised field name.
+    """
+    all_fields = dataclasses.fields(obj)
+    known_names = {f.name for f in all_fields}
+    unknown = set(changes) - known_names
+    if unknown:
+        raise TypeError(f"_dataclass_replace() got unexpected field names: {unknown!r}")
+
+    # Collect current values for every field, then overlay changes
+    current_values: dict[str, Any] = {
+        f.name: object.__getattribute__(obj, f.name) for f in all_fields
+    }
+    current_values.update(changes)
+
+    init_kwargs = {f.name: current_values[f.name] for f in all_fields if f.init}
+    non_init_overrides = {
+        f.name: current_values[f.name]
+        for f in all_fields
+        if not f.init and f.name in changes
+    }
+
+    new_obj = type(obj)(**init_kwargs)
+
+    # Stamp non-init fields that were explicitly changed
+    for name, value in non_init_overrides.items():
+        object.__setattr__(new_obj, name, value)
+
+    return new_obj
+
+
 @dataclass_transform(
     field_specifiers=(
         orig_field,
@@ -438,8 +492,9 @@ class DataClass:
                         f"Can only set attribute functionally on a dataclass, but got {current_parent.__class__}"
                     )
 
-                # Use standard dataclasses.replace to functionally copy and update the frozen dataclass
-                cur_attr = dataclasses.replace(current_parent, **{str(op): cur_attr})
+                # Use _dataclass_replace (instead of dataclasses.replace) so that
+                # private/non-init fields are handled correctly.
+                cur_attr = _dataclass_replace(current_parent, **{str(op): cur_attr})
 
             elif op_type in ("index", "key"):
                 if not hasattr(current_parent, "copy"):
@@ -520,8 +575,8 @@ class DataClass:
         Returns:
             Self: A newly instantiated object with the updated attributes.
         """
-        # Directly utilize dataclasses.replace for standard functional updates
-        return dataclasses.replace(self, **kwargs)
+        # Use _dataclass_replace so private (init=False) fields are handled correctly.
+        return _dataclass_replace(self, **kwargs)
 
 
 _DC = TypeVar("_DC", bound="DataClass")
