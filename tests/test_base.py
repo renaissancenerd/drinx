@@ -1362,7 +1362,7 @@ class TestAsetTopLevel:
 
     def test_nonexistent_attribute_create_new_ok_true_still_raises(self):
         # create_new_ok=True only skips the existence check on the walk-down;
-        # dataclasses.replace will still reject unknown fields.
+        # unknown fields are rejected because they are not registered dataclass fields.
         class Foo(DataClass):
             x: float
 
@@ -1398,7 +1398,7 @@ class TestAsetTopLevel:
         assert float(updated.x) == pytest.approx(42.0)
 
     def test_update_private_field_raises(self):
-        # dataclasses.replace() disallows init=False fields; private_field sets init=False
+        # allow_private defaults to False; non-init fields must be explicitly opted into
         class Foo(DataClass):
             x: float
             _cache: float = private_field(default=0.0)
@@ -1424,6 +1424,118 @@ class TestAsetTopLevel:
         leaves = jax.tree_util.tree_leaves(updated)
         assert 10.0 in leaves
         assert 2.0 in leaves
+
+
+# ---------------------------------------------------------------------------
+# aset method — non-init (private) fields (require allow_private=True)
+# ---------------------------------------------------------------------------
+
+
+class TestAsetNonInitFields:
+    def test_dynamic_private_field_direct(self):
+        class Foo(DataClass):
+            x: float
+            _cache: float = private_field(default=0.0)
+
+        foo = Foo(x=1.0)
+        updated = foo.aset("_cache", 5.0, allow_private=True)
+        assert updated._cache == 5.0
+        assert updated.x == 1.0
+
+    def test_static_private_field_direct(self):
+        class Foo(DataClass):
+            x: float
+            _static: int = static_private_field(default=0)
+
+        foo = Foo(x=1.0)
+        updated = foo.aset("_static", 99, allow_private=True)
+        assert updated._static == 99
+        assert updated.x == 1.0
+
+    def test_update_preserves_other_init_fields(self):
+        class Foo(DataClass):
+            x: float
+            y: float
+            _cache: float = private_field(default=0.0)
+
+        foo = Foo(x=1.0, y=2.0)
+        updated = foo.aset("_cache", 7.0, allow_private=True)
+        assert updated._cache == 7.0
+        assert updated.x == 1.0
+        assert updated.y == 2.0
+
+    def test_update_preserves_other_non_init_fields(self):
+        class Foo(DataClass):
+            x: float
+            _a: float = private_field(default=10.0)
+            _b: float = private_field(default=20.0)
+
+        foo = Foo(x=1.0)
+        updated = foo.aset("_a", 99.0, allow_private=True)
+        assert updated._a == 99.0
+        assert updated._b == 20.0
+
+    def test_nested_path_ending_at_private_field(self):
+        class Inner(DataClass):
+            w: float
+            _cache: float = private_field(default=0.0)
+
+        class Outer(DataClass):
+            inner: Inner
+            bias: float
+
+        outer = Outer(inner=Inner(w=1.0), bias=0.5)
+        updated = outer.aset("inner->_cache", 42.0, allow_private=True)
+        assert updated.inner._cache == 42.0
+        assert updated.inner.w == 1.0
+        assert updated.bias == 0.5
+
+    def test_at_proxy_with_private_field(self):
+        class Foo(DataClass):
+            x: float
+            _cache: float = private_field(default=0.0)
+
+        foo = Foo(x=1.0)
+        updated = foo.at["_cache"].set(5.0, allow_private=True)
+        assert updated._cache == 5.0
+        assert updated.x == 1.0
+
+    def test_private_field_with_default_factory(self):
+        class Foo(DataClass):
+            x: float
+            _items: list = private_field(default_factory=list)
+
+        foo = Foo(x=1.0)
+        updated = foo.aset("_items", [1, 2, 3], allow_private=True)
+        assert updated._items == [1, 2, 3]
+        assert updated.x == 1.0
+
+    def test_updated_result_is_valid_pytree(self):
+        class Foo(DataClass):
+            x: float
+            _cache: float = private_field(default=0.0)
+
+        foo = Foo(x=1.0)
+        updated = foo.aset("_cache", 5.0, allow_private=True)
+        leaves = jax.tree_util.tree_leaves(updated)
+        assert updated.x in leaves
+        assert updated._cache in leaves
+
+    def test_private_field_no_default(self):
+        """aset with allow_private=True must work for init=False fields that have no
+        default and were never set — so hasattr returns False but the field IS declared."""
+
+        class Foo(DataClass):
+            x: float
+            _derived: float = private_field()
+            # No __post_init__: _derived is absent from instance.__dict__
+
+        foo = Foo(x=3.0)  # ty:ignore[missing-argument]
+        # Before fix: raises "Attribute: _derived does not exist" because hasattr is False
+        # After fix: should return an updated copy with _derived set
+        updated = foo.aset("_derived", 99.0, allow_private=True)
+        assert updated._derived == pytest.approx(99.0)
+        assert updated.x == pytest.approx(3.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1932,3 +2044,370 @@ class TestAsetInplace:
 
         m = Model(weights=[1.0, 2.0, 3.0])  # ty:ignore[missing-argument]
         assert m.n_params == 3
+
+
+# ---------------------------------------------------------------------------
+# aset_inplace — create_new_ok
+# ---------------------------------------------------------------------------
+
+
+class TestAsetInplaceCreateNewOk:
+    def test_default_raises_on_missing_attribute(self):
+        class Foo(DataClass):
+            x: float
+
+        foo = Foo(x=1.0)
+        with pytest.raises(Exception, match="does not exist"):
+            foo.aset_inplace("nonexistent", 42.0)
+
+    def test_default_raises_on_missing_dict_key(self):
+        class Foo(DataClass):
+            data: dict
+
+        foo = Foo(data={"a": 1.0})
+        with pytest.raises(Exception, match="does not exist"):
+            foo.aset_inplace("data->['missing']", 99.0)
+
+    def test_create_new_ok_sets_new_attribute(self):
+        class Foo(DataClass):
+            x: float
+
+        foo = Foo(x=1.0)
+        foo.aset_inplace("brand_new", 7.0, create_new_ok=True)
+        assert foo.brand_new == 7.0  # type: ignore[attr-defined]
+
+    def test_create_new_ok_creates_new_dict_key(self):
+        class Foo(DataClass):
+            data: dict
+
+        foo = Foo(data={"a": 1.0})
+        foo.aset_inplace("data->['b']", 2.0, create_new_ok=True)
+        assert foo.data["b"] == 2.0
+        assert foo.data["a"] == 1.0
+
+    def test_existing_attribute_works_with_default(self):
+        class Foo(DataClass):
+            x: float
+
+        foo = Foo(x=1.0)
+        foo.aset_inplace("x", 5.0)
+        assert foo.x == 5.0
+
+    def test_existing_dict_key_works_with_default(self):
+        class Foo(DataClass):
+            data: dict
+
+        foo = Foo(data={"k": 0.0})
+        foo.aset_inplace("data->['k']", 9.0)
+        assert foo.data["k"] == 9.0
+
+    def test_list_index_unaffected_by_create_new_ok_false(self):
+        class Foo(DataClass):
+            items: list
+
+        foo = Foo(items=[1.0, 2.0])
+        foo.aset_inplace("items->[1]", 99.0)
+        assert foo.items[1] == 99.0
+
+    def test_list_index_unaffected_by_create_new_ok_true(self):
+        class Foo(DataClass):
+            items: list
+
+        foo = Foo(items=[1.0, 2.0])
+        foo.aset_inplace("items->[0]", 55.0, create_new_ok=True)
+        assert foo.items[0] == 55.0
+
+    def test_nested_path_missing_key_raises(self):
+        class Inner(DataClass):
+            data: dict
+
+        class Outer(DataClass):
+            inner: Inner
+
+        outer = Outer(inner=Inner(data={"a": 1.0}))
+        with pytest.raises(Exception, match="does not exist"):
+            outer.aset_inplace("inner->data->['missing']", 0.0)
+
+    def test_nested_path_missing_key_create_ok(self):
+        class Inner(DataClass):
+            data: dict
+
+        class Outer(DataClass):
+            inner: Inner
+
+        outer = Outer(inner=Inner(data={"a": 1.0}))
+        outer.aset_inplace("inner->data->['new_key']", 42.0, create_new_ok=True)
+        assert outer.inner.data["new_key"] == 42.0
+        assert outer.inner.data["a"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# aset_inplace — bypass_callbacks
+# ---------------------------------------------------------------------------
+
+
+class TestAsetInplaceBypassCallbacks:
+    def test_default_runs_callbacks(self):
+        class Foo(DataClass):
+            x: int = field(default=1, on_setattr=(lambda v: v * 2,))
+
+        foo = Foo()
+        assert foo.x == 2  # init ran callback: 1 * 2 = 2
+        foo.aset_inplace("x", 5)
+        assert foo.x == 10  # default bypass_callbacks=False: callback fires, 5 * 2 = 10
+
+    def test_bypass_true_explicit_skips_callback(self):
+        class Foo(DataClass):
+            x: int = field(default=1, on_setattr=(lambda v: v * 3,))
+
+        foo = Foo()
+        foo.aset_inplace("x", 4, bypass_callbacks=True)
+        assert foo.x == 4  # not 12
+
+    def test_bypass_false_runs_callback(self):
+        class Foo(DataClass):
+            x: int = field(default=1, on_setattr=(lambda v: v * 2,))
+
+        foo = Foo()
+        foo.aset_inplace("x", 5, bypass_callbacks=False)
+        assert foo.x == 10  # callback fired: 5 * 2 = 10
+
+    def test_bypass_false_no_callback_registered(self):
+        class Foo(DataClass):
+            x: float
+
+        foo = Foo(x=1.0)
+        foo.aset_inplace("x", 9.0, bypass_callbacks=False)
+        assert foo.x == 9.0  # no callback: value unchanged
+
+    def test_bypass_false_chained_callbacks(self):
+        class Foo(DataClass):
+            x: int = field(
+                default=1,
+                on_setattr=(lambda v: v + 1, lambda v: v * 3),
+            )
+
+        foo = Foo()
+        assert foo.x == 6  # init: (1+1)*3 = 6
+        foo.aset_inplace("x", 2, bypass_callbacks=False)
+        assert foo.x == 9  # (2+1)*3 = 9
+
+    def test_bypass_false_private_field(self):
+        """bypass_callbacks=False on an init=False field after initialization."""
+
+        class Foo(DataClass):
+            x: float
+            _derived: float = field(
+                init=False, default=0.0, on_setattr=(lambda v: v * 2,)
+            )
+
+        foo = Foo(x=5.0)
+        # DataClass.__post_init__ applied callback to default: 0.0 * 2 = 0.0
+        assert foo._derived == 0.0
+        foo.aset_inplace("_derived", 3.0, bypass_callbacks=False)
+        assert foo._derived == 6.0  # callback fired: 3.0 * 2 = 6.0
+
+    def test_bypass_false_index_op_no_callbacks(self):
+        """bypass_callbacks=False on a list index: no callbacks exist, value written as-is."""
+
+        class Foo(DataClass):
+            items: list
+
+        foo = Foo(items=[1.0, 2.0])
+        foo.aset_inplace("items->[0]", 77.0, bypass_callbacks=False)
+        assert foo.items[0] == 77.0
+
+    def test_bypass_false_dict_key_op_no_callbacks(self):
+        """bypass_callbacks=False on a dict key: no callbacks, value written as-is."""
+
+        class Foo(DataClass):
+            data: dict
+
+        foo = Foo(data={"k": 0.0})
+        foo.aset_inplace("data->['k']", 55.0, bypass_callbacks=False)
+        assert foo.data["k"] == 55.0
+
+    def test_create_new_ok_and_bypass_false_combined(self):
+        """create_new_ok=True and bypass_callbacks=False: new key created, callback fires on attr."""
+
+        class Foo(DataClass):
+            data: dict
+            x: int = field(default=1, on_setattr=(lambda v: v + 10,))
+
+        foo = Foo(data={})
+        # create new dict key — no callbacks apply to dict key ops
+        foo.aset_inplace(
+            "data->['fresh']", 3.0, create_new_ok=True, bypass_callbacks=False
+        )
+        assert foo.data["fresh"] == 3.0
+
+        # run callback on existing attribute
+        foo.aset_inplace("x", 5, bypass_callbacks=False)
+        assert foo.x == 15  # 5 + 10 = 15
+
+
+# ---------------------------------------------------------------------------
+# aset / .at[].set() callback behaviour
+# ---------------------------------------------------------------------------
+
+
+class TestAsetCallbacks:
+    # --- A: bypass_callbacks=True skips callbacks ---
+
+    def test_bypass_true_skips_callback_public_field(self):
+        class Foo(DataClass):
+            x: int = field(default=1, on_setattr=(lambda v: v * 2,))
+
+        foo = Foo()
+        assert foo.x == 2  # init: 1 * 2 = 2
+        result = foo.aset("x", 3, bypass_callbacks=True)
+        assert result.x == 3  # callback bypassed, not 6
+
+    def test_bypass_true_skips_callback_private_field(self):
+        class Foo(DataClass):
+            x: int = field(default=0)
+            _computed: str = field(
+                init=False, default="", on_setattr=(lambda v: v.upper(),)
+            )
+
+        foo = Foo(x=1)
+        result = foo.aset(
+            "_computed", "hello", allow_private=True, bypass_callbacks=True
+        )
+        assert result._computed == "hello"  # callback bypassed, not "HELLO"
+
+    # --- B: bypass_callbacks=False (default) runs callbacks ---
+
+    def test_default_runs_callback_public_field(self):
+        class Foo(DataClass):
+            x: int = field(default=1, on_setattr=(lambda v: v * 2,))
+
+        foo = Foo()
+        result = foo.aset("x", 3)  # bypass_callbacks defaults to False
+        assert result.x == 6  # callback ran: 3 * 2 = 6
+
+    def test_bypass_false_runs_callback_public_field(self):
+        class Foo(DataClass):
+            x: int = field(default=1, on_setattr=(lambda v: v * 2,))
+
+        foo = Foo()
+        result = foo.aset("x", 3, bypass_callbacks=False)
+        assert result.x == 6
+
+    def test_bypass_false_runs_callback_private_field(self):
+        class Foo(DataClass):
+            x: int = field(default=0)
+            _raw: float = field(init=False, default=0.0, on_setattr=(lambda v: abs(v),))
+
+        foo = Foo(x=1)
+        result = foo.aset("_raw", -5.0, allow_private=True, bypass_callbacks=False)
+        assert result._raw == 5.0  # callback ran: abs(-5.0) = 5.0
+
+    def test_callback_chain_applied_in_order(self):
+        class Foo(DataClass):
+            x: int = field(default=0, on_setattr=(lambda v: v + 1, lambda v: v * 2))
+
+        foo = Foo(x=0)
+        result = foo.aset("x", 3, bypass_callbacks=False)
+        assert result.x == 8  # (3 + 1) * 2 = 8
+
+    def test_callback_returning_none_passes_value_through(self):
+        class Foo(DataClass):
+            x: int = field(default=0, on_setattr=(lambda v: None,))
+
+        foo = Foo(x=0)
+        result = foo.aset("x", 42, bypass_callbacks=False)
+        assert result.x == 42  # None return means pass-through
+
+    # --- C: Nested paths ---
+
+    def test_bypass_false_fires_leaf_callback_in_nested_path(self):
+        class Inner(DataClass):
+            w: int = field(default=0, on_setattr=(lambda v: v + 10,))
+
+        class Outer(DataClass):
+            inner: Inner
+
+        outer = Outer(inner=Inner(w=1))
+        assert outer.inner.w == 11  # init: 1 + 10 = 11
+        result = outer.aset("inner->w", 5, bypass_callbacks=False)
+        assert result.inner.w == 15  # callback ran: 5 + 10 = 15
+
+    def test_bypass_false_fires_intermediate_callback_in_nested_path(self):
+        class Inner(DataClass):
+            w: int
+
+        class Outer(DataClass):
+            inner: Inner = field(
+                default_factory=lambda: Inner(w=0),
+                on_setattr=(lambda v: type(v)(w=v.w * 2),),
+            )
+
+        outer = Outer(inner=Inner(w=3))
+        assert outer.inner.w == 6  # init: outer's callback doubled w: 3 * 2 = 6
+        result = outer.aset("inner->w", 5, bypass_callbacks=False)
+        # leaf step: no callback on w → new inner has w=5
+        # intermediate step: outer's inner callback fires → Inner(w=5*2=10)
+        assert result.inner.w == 10
+
+    def test_bypass_true_skips_all_callbacks_nested(self):
+        class Inner(DataClass):
+            w: int = field(default=0, on_setattr=(lambda v: v + 10,))
+
+        class Outer(DataClass):
+            inner: Inner
+
+        outer = Outer(inner=Inner(w=1))
+        result = outer.aset("inner->w", 5, bypass_callbacks=True)
+        assert result.inner.w == 5  # w's callback skipped
+
+    # --- D: .at[].set() delegation ---
+
+    def test_at_set_default_runs_callback(self):
+        class Foo(DataClass):
+            x: int = field(default=1, on_setattr=(lambda v: v * 2,))
+
+        foo = Foo()
+        result = foo.at["x"].set(3)
+        assert result.x == 6
+
+    def test_at_set_bypass_true_skips_callback(self):
+        class Foo(DataClass):
+            x: int = field(default=1, on_setattr=(lambda v: v * 2,))
+
+        foo = Foo()
+        result = foo.at["x"].set(3, bypass_callbacks=True)
+        assert result.x == 3
+
+    def test_at_set_private_field_runs_callback(self):
+        class Foo(DataClass):
+            x: int = field(default=0)
+            _raw: float = field(init=False, default=0.0, on_setattr=(lambda v: abs(v),))
+
+        foo = Foo(x=1)
+        result = foo.at["_raw"].set(-7.0, allow_private=True)
+        assert result._raw == 7.0
+
+    # --- E: aset_inplace does not run callbacks ---
+
+    def test_aset_inplace_runs_callbacks_by_default(self):
+        class Foo(DataClass):
+            x: int = field(default=1, on_setattr=(lambda v: v * 2,))
+
+        foo = Foo()
+        assert foo.x == 2  # init: 1 * 2 = 2
+        # aset_inplace default bypass_callbacks=False — callbacks fire
+        foo.aset_inplace("x", 5)
+        assert foo.x == 10  # callback ran: 5 * 2 = 10
+
+    # --- F: original object unchanged ---
+
+    def test_original_unchanged_when_callbacks_run(self):
+        class Foo(DataClass):
+            x: int = field(default=3, on_setattr=(lambda v: v * 2,))
+
+        foo = Foo()
+        assert foo.x == 6  # init: 3 * 2 = 6
+        updated = foo.aset("x", 5, bypass_callbacks=False)
+        assert updated.x == 10  # 5 * 2 = 10
+        assert foo.x == 6  # original untouched

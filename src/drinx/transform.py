@@ -19,11 +19,29 @@ def _register_jax_tree(cls_: type[T]) -> type[T]:
     dynamic_fields = [f.name for f in fields(cls_) if not f.metadata.get("jax_static")]
 
     def flatten_with_keys(obj):
-        keyed_leaves = [
-            (jax.tree_util.GetAttrKey(f), getattr(obj, f)) for f in dynamic_fields
-        ]
-        aux = tuple(getattr(obj, f) for f in static_fields)
-        return keyed_leaves, aux
+        keyed_leaves = []
+        for f in dynamic_fields:
+            try:
+                val = getattr(obj, f)
+            except AttributeError:
+                raise AttributeError(
+                    f"Field '{f}' of '{type(obj).__name__}' has not been set. "
+                    "Non-init fields must be assigned a default value or set in __post_init__."
+                ) from None
+            keyed_leaves.append((jax.tree_util.GetAttrKey(f), val))
+
+        aux = []
+        for f in static_fields:
+            try:
+                val = getattr(obj, f)
+            except AttributeError:
+                raise AttributeError(
+                    f"Field '{f}' of '{type(obj).__name__}' has not been set. "
+                    "Non-init fields must be assigned a default value or set in __post_init__."
+                ) from None
+            aux.append(val)
+
+        return keyed_leaves, tuple(aux)
 
     def unflatten(aux, leaves):
         kwargs = {**dict(zip(static_fields, aux)), **dict(zip(dynamic_fields, leaves))}
@@ -124,7 +142,10 @@ def dataclass(
         unsafe_hash: Force generation of ``__hash__`` even when ``eq=True``.
         match_args: Set ``__match_args__`` for structural pattern matching.
         kw_only: Make all fields keyword-only in ``__init__``.
-        slots: Generate ``__slots__``.
+        slots: Not supported.  Slot-based dataclasses are excluded because
+            ``__slots__`` attribute-access speedups are negligible compared to
+            JAX kernel dispatch overhead, and supporting them would add
+            significant complexity to pytree flatten/unflatten.
         weakref_slot: Add a ``__weakref__`` slot.
 
     Returns:
@@ -135,6 +156,7 @@ def dataclass(
         ``frozen=True`` is always enforced and cannot be overridden.  Mutability
         would break JAX's pytree contract.
     """
+    del slots, weakref_slot
 
     # The wrapper handles the actual class modification
     def wrapper(cls_: type[T]) -> type[T]:
@@ -157,8 +179,8 @@ def dataclass(
             frozen=True,
             match_args=match_args,
             kw_only=kw_only,
-            slots=slots,
-            weakref_slot=weakref_slot,
+            slots=False,
+            weakref_slot=False,
         )
         cls_ = decorator(cls_)
         return _register_jax_tree(cls_)
